@@ -19,6 +19,60 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 280）。
 ./mvnw -q verify
 ```
 
+## 框架说明
+
+实现位于 `com.example.gsb.leakdetector` 包，核心组件：
+
+| 组件 | 职责 |
+|------|------|
+| `ResourceRegistry` / `ResourceLease` | 线程安全的资源登记处；创建即登记（自动捕获调用点），释放即注销 |
+| `ResourceProvider` | 可替换的资源提供者（函数式接口），默认 `RegistryBackedProvider`，测试可用 lambda 模拟线程/句柄/连接数 |
+| `ResourceSnapshot` | 某一时刻各类型资源数量与存活实例的不可变快照 |
+| `LeakDetector` / `LeakPolicy` | 快照对比与泄漏判定；策略含允许增长类型与延迟回收容忍窗口 |
+| `LeakReport` | 判定结果：泄漏明细（含创建调用点）、被忽略的允许增长、复检次数 |
+| `SuiteLeakTracker` / `SuiteLeakReport` | 套件级检测，把泄漏归因到首次引入它的测试 |
+| `LeakStatistics` | 各测试资源增减、泄漏次数、被忽略的允许增长数 |
+| `@DetectLeaks` / `LeakDetectionExtension` | JUnit 5 集成，支持 `TEST` / `SUITE` / `TEST_AND_SUITE` 粒度 |
+
+### 用法示例
+
+```java
+@DetectLeaks(allowedGrowth = ResourceType.THREAD,   // 线程池预热等允许增长
+             toleranceMillis = 500,                 // 延迟回收容忍窗口
+             granularity = Granularity.TEST_AND_SUITE)
+class MyServiceTest {
+    @Test
+    void usesConnection() {
+        try (ResourceLease lease = LeakDetection.registry()
+                .lease(ResourceType.CONNECTION, "jdbc:mock://db")) {
+            // 被测代码；try 结束自动释放，不释放则测试失败并打印创建调用点
+        }
+    }
+}
+```
+
+泄漏失败信息形如：`CONNECTION: +1` 并附 `jdbc:mock://db created at com.example.MyServiceTest.usesConnection(MyServiceTest.java:18)`，可直接定位到引入泄漏的调用点；套件级报告会指出具体是哪个测试引入的泄漏。
+
+## JVM 上的局限与降低误报的建议
+
+这类"前后快照对比"的检测在 JVM 上存在固有局限：
+
+- **线程池与线程复用**：线程池（如 `ForkJoinPool`、连接池内部线程）会按需创建并长期持有工作线程，首次使用线程池的测试会"制造"线程数增长，但这并非泄漏。
+- **JVM 内部线程**：GC、JIT 编译器（C1/C2）、VM 周期性任务等线程由 JVM 自行管理，数量随运行时间、堆压力变化，与被测代码无关。
+- **JIT 与类加载**：JIT 编译/去优化、类的延迟加载会改变内存与线程基线；同一代码冷运行与热运行的资源画像不同。
+- **GC 与终结时机不确定**：对象何时被回收、`Cleaner`/finalizer 何时执行不可预测，测试刚结束时资源可能"正在回收"，立即判定会误报。
+- **句柄观测滞后**：通过 `/proc/self/fd` 或 `FileDescriptor` 统计句柄时，操作系统与 JVM 的关闭存在异步窗口。
+- **连接池**：池化连接是刻意持有的，数量增长往往是池预热而非泄漏。
+
+降低误报的建议：
+
+- 使用 `toleranceMillis` 给异步回收留出宽限，检测器会在窗口内多次复检（本框架默认 50ms 轮询一次）。
+- 用 `allowedGrowth` 显式豁免可解释的增长（如线程池预热），豁免量会被统计为"被忽略的允许增长"而非静默吞掉。
+- 先跑一段 warm-up（或在套件级基线前完成池/JIT 预热），让基线在稳态下采集。
+- 用可替换的 `ResourceProvider` 只统计业务自己登记的资源，而不是 JVM 全局线程/句柄数，从源头避开 JVM 内部噪音。
+- 避免并行跑测试时共享同一个全局登记处；必要时每个测试类使用独立 `ResourceRegistry`。
+- 对偶发误报的用例，结合统计（`LeakStatistics`）观察趋势，而不是单次失败就定责。
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
